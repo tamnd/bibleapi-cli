@@ -1,35 +1,31 @@
 // Package bibleapi is the library behind the bibleapi command line:
-// the HTTP client, request shaping, and the typed data models for bibleapi.
+// the HTTP client, request shaping, and the typed data models for bible-api.com.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package bibleapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to bibleapi. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "bibleapi/dev (+https://github.com/tamnd/bibleapi-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at bibleapi.com; change it once you
-// know the real endpoints you want to read.
-const Host = "bibleapi.com"
+// Host is the site this client talks to.
+const Host = "bible-api.com"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to bibleapi over HTTP.
+// DefaultUserAgent identifies the client to bible-api.com.
+const DefaultUserAgent = "bibleapi-cli/0.1 (tamnd87@gmail.com)"
+
+// Client talks to bible-api.com over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,20 +36,99 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: 15 * time.Second},
 		UserAgent: DefaultUserAgent,
 		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+// Verse is the summary record for a single verse or passage lookup.
+type Verse struct {
+	Reference       string `json:"reference"        kit:"id"`
+	Text            string `json:"text"`
+	TranslationID   string `json:"translation_id"`
+	TranslationName string `json:"translation_name"`
+}
+
+// VerseDetail is one individual verse within a passage.
+type VerseDetail struct {
+	BookID   string `json:"book_id"`
+	BookName string `json:"book_name"`
+	Chapter  int    `json:"chapter"`
+	Verse    int    `json:"verse"`
+	Text     string `json:"text"`
+}
+
+// apiResponse mirrors what bible-api.com returns.
+type apiResponse struct {
+	Reference       string        `json:"reference"`
+	Verses          []VerseDetail `json:"verses"`
+	Text            string        `json:"text"`
+	TranslationID   string        `json:"translation_id"`
+	TranslationName string        `json:"translation_name"`
+	TranslationNote string        `json:"translation_note"`
+}
+
+// GetVerse fetches a verse or passage reference and returns a summary Verse.
+// The reference should use spaces (e.g. "john 3:16" or "romans 8:28-30").
+// translation is optional; pass "" to use the API default (web).
+func (c *Client) GetVerse(ctx context.Context, reference, translation string) (*Verse, error) {
+	resp, err := c.fetch(ctx, reference, translation)
+	if err != nil {
+		return nil, err
+	}
+	return &Verse{
+		Reference:       resp.Reference,
+		Text:            strings.TrimSpace(resp.Text),
+		TranslationID:   resp.TranslationID,
+		TranslationName: resp.TranslationName,
+	}, nil
+}
+
+// GetPassage fetches a passage and returns each verse as a VerseDetail.
+func (c *Client) GetPassage(ctx context.Context, reference, translation string) ([]VerseDetail, error) {
+	resp, err := c.fetch(ctx, reference, translation)
+	if err != nil {
+		return nil, err
+	}
+	// Trim whitespace from each verse text.
+	for i := range resp.Verses {
+		resp.Verses[i].Text = strings.TrimSpace(resp.Verses[i].Text)
+	}
+	return resp.Verses, nil
+}
+
+// fetch makes the actual HTTP call and decodes the JSON response.
+func (c *Client) fetch(ctx context.Context, reference, translation string) (*apiResponse, error) {
+	url := buildURL(reference, translation)
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
+	}
+	var resp apiResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &resp, nil
+}
+
+// buildURL constructs the bible-api.com request URL.
+// Spaces in the reference are replaced with '+' as required by the API.
+func buildURL(reference, translation string) string {
+	ref := strings.ReplaceAll(strings.TrimSpace(reference), " ", "+")
+	u := BaseURL + "/" + ref
+	if translation != "" {
+		u += "?translation=" + translation
+	}
+	return u
+}
+
+// Get fetches url and returns the response body. It paces and retries
+// according to the client's settings.
 func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
@@ -121,80 +196,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on bibleapi.com. It is a stand-in for the typed records you
-// will model from the real bibleapi endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `bibleapi cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
